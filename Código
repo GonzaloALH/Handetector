@@ -1,0 +1,519 @@
+import cv2
+import mediapipe as mp
+import time
+import board
+import busio
+from adafruit_pca9685 import PCA9685
+from picamera2 import Picamera2
+from libcamera import controls
+from collections import deque
+
+# -------------------------------------------------------------------
+# CONFIGURACIÓN PCA9685
+# -------------------------------------------------------------------
+I2C_BUS = busio.I2C(board.SCL, board.SDA)
+pca = PCA9685(I2C_BUS)
+pca.frequency = 50
+PULSE_TO_DUTY = 65535 / 20000
+
+SERVO_0 = 0
+SERVO_1 = 1
+SERVO_2 = 2
+SERVO_3 = 3
+SERVO_4 = 4
+SERVO_5 = 5
+SERVO_6 = 6
+SERVO_7 = 7
+SERVO_8 = 8
+SERVO_9 = 9
+
+NEUTRAL = 1730
+
+# Pulses y duraciones (igual que antes)
+# Índice
+OPEN_PULSE = 1900
+CLOSED_PULSE = 1400
+INIT_OPEN_DUR = 4.2
+INIT_CLOSED_DUR = 4.0
+OPEN_DUR_SERVO0 = 4.7
+OPEN_DUR_SERVO1 = 4.2
+CLOSED_DUR_SERVO0 = 4.0
+CLOSED_DUR_SERVO1 = 2.4
+
+# Pulgar
+SERVO2_OPEN_PULSE = 1900
+SERVO2_CLOSED_PULSE = 1400
+SERVO3_OPEN_PULSE = 1400
+SERVO3_CLOSED_PULSE = 1900
+SERVO2_OPEN_DUR = 4.1
+SERVO2_CLOSED_DUR = 3.3
+SERVO3_OPEN_DUR = 3.2
+SERVO3_CLOSED_DUR = 3.4
+
+# Medio
+SERVO4_OPEN_PULSE = 1900
+SERVO4_CLOSED_PULSE = 1400
+SERVO5_OPEN_PULSE = 1400
+SERVO5_CLOSED_PULSE = 1900
+SERVO4_OPEN_DUR = 3.8
+SERVO4_CLOSED_DUR = 3.5
+SERVO5_OPEN_DUR = 2.5
+SERVO5_CLOSED_DUR = 3.3
+
+# Anular
+SERVO6_OPEN_PULSE = 1950
+SERVO6_CLOSED_PULSE = 1400
+SERVO7_OPEN_PULSE = 1400
+SERVO7_CLOSED_PULSE = 1950
+SERVO6_OPEN_DUR = 4.09
+SERVO6_CLOSED_DUR = 3.5
+SERVO7_OPEN_DUR = 4.55
+SERVO7_CLOSED_DUR = 4.7
+
+# Meñique
+SERVO8_OPEN_PULSE = 1900
+SERVO8_CLOSED_PULSE = 1400
+SERVO9_OPEN_PULSE = 1400
+SERVO9_CLOSED_PULSE = 1950
+SERVO8_OPEN_DUR = 3.3
+SERVO8_CLOSED_DUR = 2.3
+SERVO9_OPEN_DUR = 2.6
+SERVO9_CLOSED_DUR = 3.5
+
+# -------------------------------------------------------------------
+# FUNCIONES SERVOS
+# -------------------------------------------------------------------
+def set_pulse(channel, pulse_us):
+    pca.channels[channel].duty_cycle = int(pulse_us * PULSE_TO_DUTY)
+
+def neutral(channel):
+    set_pulse(channel, NEUTRAL)
+
+def off(channel):
+    pca.channels[channel].duty_cycle = 0
+
+def neutral_all():
+    for ch in range(10):
+        neutral(ch)
+
+def off_all():
+    for ch in range(10):
+        off(ch)
+
+off_all()
+
+# -------------------------------------------------------------------
+# MEDIAPIPE
+# -------------------------------------------------------------------
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(
+    model_complexity=0,
+    static_image_mode=False,
+    max_num_hands=1,
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.5
+)
+
+def dist2(a, b):
+    dx = a.x - b.x
+    dy = a.y - b.y
+    dz = a.z - b.z
+    return dx*dx + dy*dy + dz*dz
+
+# Buffers
+index_dist_buffer = deque(maxlen=5)
+thumb_dist_buffer = deque(maxlen=5)
+middle_dist_buffer = deque(maxlen=5)
+ring_dist_buffer = deque(maxlen=5)
+pinky_dist_buffer = deque(maxlen=5)
+
+# Funciones de detección
+def is_index_open(landmarks, current_state):
+    wrist = landmarks[0]
+    mcp_mid = landmarks[9]
+    tip_idx = landmarks[8]
+    base_idx = landmarks[5]
+
+    ref = dist2(wrist, mcp_mid)
+    if ref < 0.001:
+        return current_state
+
+    d = dist2(tip_idx, base_idx) / ref
+    index_dist_buffer.append(d)
+    avg = sum(index_dist_buffer) / len(index_dist_buffer)
+
+    THRESH_OPEN = 0.35
+    THRESH_CLOSED = 0.25
+
+    if avg > THRESH_OPEN:
+        return True
+    elif avg < THRESH_CLOSED:
+        return False
+    return current_state
+
+def is_thumb_open(landmarks, current_state):
+    wrist = landmarks[0]
+    mcp_mid = landmarks[9]
+    tip_thumb = landmarks[4]          # Punta del pulgar
+    base_pinky = landmarks[17]         # Base del meñique (MCP)
+
+    ref = dist2(wrist, mcp_mid)
+    if ref < 0.001:
+        return current_state
+
+    # Distancia única: punta del pulgar a base del meñique
+    d = dist2(tip_thumb, base_pinky) / ref
+    thumb_dist_buffer.append(d)
+    avg = sum(thumb_dist_buffer) / len(thumb_dist_buffer)
+
+    # Umbrales (puedes ajustarlos después de observar los valores en pantalla)
+    THRESH_OPEN = 0.30
+    THRESH_CLOSED = 0.20
+
+    if avg > THRESH_OPEN:
+        return True
+    elif avg < THRESH_CLOSED:
+        return False
+    return current_state
+
+def is_middle_open(landmarks, current_state):
+    wrist = landmarks[0]
+    mcp_mid = landmarks[9]
+    tip_mid = landmarks[12]
+    base_mid = landmarks[9]
+
+    ref = dist2(wrist, mcp_mid)
+    if ref < 0.001:
+        return current_state
+
+    d = dist2(tip_mid, base_mid) / ref
+    middle_dist_buffer.append(d)
+    avg = sum(middle_dist_buffer) / len(middle_dist_buffer)
+
+    THRESH_OPEN = 0.35
+    THRESH_CLOSED = 0.25
+
+    if avg > THRESH_OPEN:
+        return True
+    elif avg < THRESH_CLOSED:
+        return False
+    return current_state
+
+def is_ring_open(landmarks, current_state):
+    wrist = landmarks[0]
+    mcp_mid = landmarks[9]
+    tip_ring = landmarks[16]
+    base_ring = landmarks[13]
+
+    ref = dist2(wrist, mcp_mid)
+    if ref < 0.001:
+        return current_state
+
+    d = dist2(tip_ring, base_ring) / ref
+    ring_dist_buffer.append(d)
+    avg = sum(ring_dist_buffer) / len(ring_dist_buffer)
+
+    THRESH_OPEN = 0.35
+    THRESH_CLOSED = 0.25
+
+    if avg > THRESH_OPEN:
+        return True
+    elif avg < THRESH_CLOSED:
+        return False
+    return current_state
+
+def is_pinky_open(landmarks, current_state):
+    wrist = landmarks[0]
+    mcp_mid = landmarks[9]
+    tip_pinky = landmarks[20]
+    base_pinky = landmarks[17]
+
+    ref = dist2(wrist, mcp_mid)
+    if ref < 0.001:
+        return current_state
+
+    d = dist2(tip_pinky, base_pinky) / ref
+    pinky_dist_buffer.append(d)
+    avg = sum(pinky_dist_buffer) / len(pinky_dist_buffer)
+
+    THRESH_OPEN = 0.35
+    THRESH_CLOSED = 0.25
+
+    if avg > THRESH_OPEN:
+        return True
+    elif avg < THRESH_CLOSED:
+        return False
+    return current_state
+
+# Funciones auxiliares de movimiento
+def is_index_moving(end_times):
+    return any(ch in end_times for ch in (SERVO_0, SERVO_1))
+
+def is_thumb_moving(end_times):
+    return any(ch in end_times for ch in (SERVO_2, SERVO_3))
+
+def is_middle_moving(end_times):
+    return any(ch in end_times for ch in (SERVO_4, SERVO_5))
+
+def is_ring_moving(end_times):
+    return any(ch in end_times for ch in (SERVO_6, SERVO_7))
+
+def is_pinky_moving(end_times):
+    return any(ch in end_times for ch in (SERVO_8, SERVO_9))
+
+# -------------------------------------------------------------------
+# ESTADO DEL SISTEMA
+# -------------------------------------------------------------------
+state = 'initial'
+last_index_pose = None
+last_thumb_pose = None
+last_middle_pose = None
+last_ring_pose = None
+last_pinky_pose = None
+end_times = {}
+
+LAST_HAND_TIME = time.time()
+HAND_TIMEOUT = 1.0
+
+# -------------------------------------------------------------------
+# CÁMARA
+# -------------------------------------------------------------------
+picam2 = Picamera2()
+config = picam2.create_preview_configuration(
+    main={"size": (640, 480), "format": "RGB888"}
+)
+picam2.configure(config)
+picam2.start()
+picam2.set_controls({"AfMode": controls.AfModeEnum.Continuous})
+time.sleep(2)
+
+print("Sistema listo. Neutro = 1730 µs. Pulgar ahora referenciado a base del meñique.")
+
+FRAME_PERIOD = 0.05
+next_frame = time.time()
+
+try:
+    while True:
+        now = time.time()
+        if now < next_frame:
+            continue
+        next_frame += FRAME_PERIOD
+
+        rgb = picam2.capture_array()
+        rgb = cv2.flip(rgb, 1)
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+        results = hands.process(rgb)
+
+        cv2.putText(bgr, f"FPS: {1/FRAME_PERIOD:.1f}", (10, 250),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        # Finalizar movimientos
+        finished = [ch for ch, t in end_times.items() if now >= t]
+        for ch in finished:
+            neutral(ch)
+            del end_times[ch]
+
+        # Watchdog
+        if results.multi_hand_landmarks:
+            LAST_HAND_TIME = now
+        elif now - LAST_HAND_TIME > HAND_TIMEOUT:
+            neutral_all()
+            end_times.clear()
+
+        if results.multi_hand_landmarks:
+            hand = results.multi_hand_landmarks[0].landmark
+
+            current_index = is_index_open(hand, last_index_pose if last_index_pose is not None else False)
+            current_thumb = is_thumb_open(hand, last_thumb_pose if last_thumb_pose is not None else False)
+            current_middle = is_middle_open(hand, last_middle_pose if last_middle_pose is not None else False)
+            current_ring = is_ring_open(hand, last_ring_pose if last_ring_pose is not None else False)
+            current_pinky = is_pinky_open(hand, last_pinky_pose if last_pinky_pose is not None else False)
+
+            # Mostrar estados
+            cv2.putText(bgr, f"Indice: {'Abierto' if current_index else 'Cerrado'}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(bgr, f"Pulgar: {'Abierto' if current_thumb else 'Cerrado'}", (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(bgr, f"Medio:  {'Abierto' if current_middle else 'Cerrado'}", (10, 90),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(bgr, f"Anular: {'Abierto' if current_ring else 'Cerrado'}", (10, 120),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(bgr, f"Meñique:{'Abierto' if current_pinky else 'Cerrado'}", (10, 150),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+            # Mostrar valores normalizados
+            wrist = hand[0]
+            mcp_mid = hand[9]
+            ref = dist2(wrist, mcp_mid)
+            if ref > 0.001:
+                d_index = dist2(hand[8], hand[5]) / ref
+                d_thumb = dist2(hand[4], hand[17]) / ref   # <-- ahora muestra la nueva distancia
+                d_middle = dist2(hand[12], hand[9]) / ref
+                d_ring = dist2(hand[16], hand[13]) / ref
+                d_pinky = dist2(hand[20], hand[17]) / ref
+
+                cv2.putText(bgr, f"Idx:{d_index:.2f} Pul(Meñ):{d_thumb:.2f}", (10, 180),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                cv2.putText(bgr, f"Mid:{d_middle:.2f} Ring:{d_ring:.2f} Pink:{d_pinky:.2f}", (10, 200),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+            # Lógica de estados (idéntica a la anterior, solo cambia la detección del pulgar)
+            if state == 'initial':
+                # Índice
+                if not is_index_moving(end_times):
+                    if current_index:
+                        set_pulse(SERVO_1, OPEN_PULSE)
+                        end_times[SERVO_1] = now + INIT_OPEN_DUR
+                    else:
+                        set_pulse(SERVO_0, CLOSED_PULSE)
+                        end_times[SERVO_0] = now + INIT_CLOSED_DUR
+
+                # Pulgar
+                if not is_thumb_moving(end_times):
+                    if current_thumb:
+                        set_pulse(SERVO_3, SERVO3_CLOSED_PULSE)
+                        end_times[SERVO_3] = now + SERVO3_CLOSED_DUR
+                    else:
+                        set_pulse(SERVO_2, SERVO2_CLOSED_PULSE)
+                        end_times[SERVO_2] = now + SERVO2_CLOSED_DUR
+
+                # Medio
+                if not is_middle_moving(end_times):
+                    if current_middle:
+                        set_pulse(SERVO_5, SERVO5_OPEN_PULSE)
+                        end_times[SERVO_5] = now + SERVO5_OPEN_DUR
+                    else:
+                        set_pulse(SERVO_4, SERVO4_CLOSED_PULSE)
+                        end_times[SERVO_4] = now + SERVO4_CLOSED_DUR
+
+                # Anular
+                if not is_ring_moving(end_times):
+                    if current_ring:
+                        set_pulse(SERVO_7, SERVO7_OPEN_PULSE)
+                        end_times[SERVO_7] = now + SERVO7_OPEN_DUR
+                    else:
+                        set_pulse(SERVO_6, SERVO6_CLOSED_PULSE)
+                        end_times[SERVO_6] = now + SERVO6_CLOSED_DUR
+
+                # Meñique
+                if not is_pinky_moving(end_times):
+                    if current_pinky:
+                        set_pulse(SERVO_9, SERVO9_OPEN_PULSE)
+                        end_times[SERVO_9] = now + SERVO9_OPEN_DUR
+                    else:
+                        set_pulse(SERVO_8, SERVO8_CLOSED_PULSE)
+                        end_times[SERVO_8] = now + SERVO8_CLOSED_DUR
+
+                last_index_pose = current_index
+                last_thumb_pose = current_thumb
+                last_middle_pose = current_middle
+                last_ring_pose = current_ring
+                last_pinky_pose = current_pinky
+                state = 'running'
+                # Limpiar buffers
+                index_dist_buffer.clear()
+                thumb_dist_buffer.clear()
+                middle_dist_buffer.clear()
+                ring_dist_buffer.clear()
+                pinky_dist_buffer.clear()
+
+            elif state == 'running':
+                index_changed = (current_index != last_index_pose)
+                thumb_changed = (current_thumb != last_thumb_pose)
+                middle_changed = (current_middle != last_middle_pose)
+                ring_changed = (current_ring != last_ring_pose)
+                pinky_changed = (current_pinky != last_pinky_pose)
+
+                # Índice
+                if index_changed and not is_index_moving(end_times):
+                    if current_index:
+                        set_pulse(SERVO_0, OPEN_PULSE)
+                        set_pulse(SERVO_1, OPEN_PULSE)
+                        end_times[SERVO_0] = now + OPEN_DUR_SERVO0
+                        end_times[SERVO_1] = now + OPEN_DUR_SERVO1
+                    else:
+                        set_pulse(SERVO_0, CLOSED_PULSE)
+                        set_pulse(SERVO_1, CLOSED_PULSE)
+                        end_times[SERVO_0] = now + CLOSED_DUR_SERVO0
+                        end_times[SERVO_1] = now + CLOSED_DUR_SERVO1
+                    last_index_pose = current_index
+                    index_dist_buffer.clear()
+
+                # Pulgar
+                if thumb_changed and not is_thumb_moving(end_times):
+                    if current_thumb:
+                        set_pulse(SERVO_2, SERVO2_OPEN_PULSE)
+                        set_pulse(SERVO_3, SERVO3_OPEN_PULSE)
+                        end_times[SERVO_2] = now + SERVO2_OPEN_DUR
+                        end_times[SERVO_3] = now + SERVO3_OPEN_DUR
+                    else:
+                        set_pulse(SERVO_2, SERVO2_CLOSED_PULSE)
+                        set_pulse(SERVO_3, SERVO3_CLOSED_PULSE)
+                        end_times[SERVO_2] = now + SERVO2_CLOSED_DUR
+                        end_times[SERVO_3] = now + SERVO3_CLOSED_DUR
+                    last_thumb_pose = current_thumb
+                    thumb_dist_buffer.clear()
+
+                # Medio
+                if middle_changed and not is_middle_moving(end_times):
+                    if current_middle:
+                        set_pulse(SERVO_4, SERVO4_OPEN_PULSE)
+                        set_pulse(SERVO_5, SERVO5_OPEN_PULSE)
+                        end_times[SERVO_4] = now + SERVO4_OPEN_DUR
+                        end_times[SERVO_5] = now + SERVO5_OPEN_DUR
+                    else:
+                        set_pulse(SERVO_4, SERVO4_CLOSED_PULSE)
+                        set_pulse(SERVO_5, SERVO5_CLOSED_PULSE)
+                        end_times[SERVO_4] = now + SERVO4_CLOSED_DUR
+                        end_times[SERVO_5] = now + SERVO5_CLOSED_DUR
+                    last_middle_pose = current_middle
+                    middle_dist_buffer.clear()
+
+                # Anular
+                if ring_changed and not is_ring_moving(end_times):
+                    if current_ring:
+                        set_pulse(SERVO_6, SERVO6_OPEN_PULSE)
+                        set_pulse(SERVO_7, SERVO7_OPEN_PULSE)
+                        end_times[SERVO_6] = now + SERVO6_OPEN_DUR
+                        end_times[SERVO_7] = now + SERVO7_OPEN_DUR
+                    else:
+                        set_pulse(SERVO_6, SERVO6_CLOSED_PULSE)
+                        set_pulse(SERVO_7, SERVO7_CLOSED_PULSE)
+                        end_times[SERVO_6] = now + SERVO6_CLOSED_DUR
+                        end_times[SERVO_7] = now + SERVO7_CLOSED_DUR
+                    last_ring_pose = current_ring
+                    ring_dist_buffer.clear()
+
+                # Meñique
+                if pinky_changed and not is_pinky_moving(end_times):
+                    if current_pinky:
+                        set_pulse(SERVO_8, SERVO8_OPEN_PULSE)
+                        set_pulse(SERVO_9, SERVO9_OPEN_PULSE)
+                        end_times[SERVO_8] = now + SERVO8_OPEN_DUR
+                        end_times[SERVO_9] = now + SERVO9_OPEN_DUR
+                    else:
+                        set_pulse(SERVO_8, SERVO8_CLOSED_PULSE)
+                        set_pulse(SERVO_9, SERVO9_CLOSED_PULSE)
+                        end_times[SERVO_8] = now + SERVO8_CLOSED_DUR
+                        end_times[SERVO_9] = now + SERVO9_CLOSED_DUR
+                    last_pinky_pose = current_pinky
+                    pinky_dist_buffer.clear()
+
+        else:
+            cv2.putText(bgr, "No hand detected", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        cv2.imshow("Control 5 dedos - Pulgar ref meñique", bgr)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+except KeyboardInterrupt:
+    pass
+
+finally:
+    off_all()
+    pca.deinit()
+    picam2.stop()
+    cv2.destroyAllWindows()
+    print("Sistema detenido de forma segura.")
